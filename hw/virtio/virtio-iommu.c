@@ -127,8 +127,42 @@ static void virtio_iommu_notify_unmap(IOMMUMemoryRegion *mr, hwaddr iova,
     memory_region_notify_iommu(mr, entry);
 }
 
+static gboolean virtio_iommu_mapping_unmap(gpointer key, gpointer value,
+                                           gpointer data)
+{
+    viommu_mapping *mapping = (viommu_mapping *) value;
+    IOMMUMemoryRegion *mr = (IOMMUMemoryRegion *) data;
+
+    virtio_iommu_notify_unmap(mr, mapping->virt_addr, mapping->size);
+
+    return false;
+}
+
+static gboolean virtio_iommu_mapping_map(gpointer key, gpointer value,
+                                         gpointer data)
+{
+    viommu_mapping *mapping = (viommu_mapping *) value;
+    IOMMUMemoryRegion *mr = (IOMMUMemoryRegion *) data;
+
+    virtio_iommu_notify_map(mr, mapping->virt_addr, mapping->phys_addr,
+                            mapping->size);
+
+    return false;
+}
+
 static void virtio_iommu_detach_dev_from_as(viommu_dev *dev)
 {
+    VirtioIOMMUNotifierNode *node;
+    VirtIOIOMMU *s = dev->viommu;
+    viommu_as *as = dev->as;
+
+    QLIST_FOREACH(node, &s->notifiers_list, next) {
+        if (dev->id == node->iommu_dev->devfn) {
+            g_tree_foreach(as->mappings, virtio_iommu_mapping_unmap,
+                           &node->iommu_dev->iommu_mr);
+        }
+    }
+
     QLIST_REMOVE(dev, next);
     dev->as = NULL;
 }
@@ -260,6 +294,7 @@ static int virtio_iommu_attach(VirtIOIOMMU *s,
     uint32_t asid = le32_to_cpu(req->address_space);
     uint32_t devid = le32_to_cpu(req->device);
     uint32_t reserved = le32_to_cpu(req->reserved);
+    VirtioIOMMUNotifierNode *node;
     viommu_as *as;
     viommu_dev *dev;
 
@@ -283,6 +318,14 @@ static int virtio_iommu_attach(VirtIOIOMMU *s,
 
     dev->as = as;
     g_tree_ref(as->mappings);
+
+    /* replay existing address space mappings on the associated mr */
+    QLIST_FOREACH(node, &s->notifiers_list, next) {
+        if (devid == node->iommu_dev->devfn) {
+            g_tree_foreach(as->mappings, virtio_iommu_mapping_map,
+                           &node->iommu_dev->iommu_mr);
+        }
+    }
 
     return VIRTIO_IOMMU_S_OK;
 }
