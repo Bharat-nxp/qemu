@@ -102,6 +102,38 @@ static gint interval_cmp(gconstpointer a, gconstpointer b, gpointer user_data)
     }
 }
 
+static void virtio_iommu_notify_map(IOMMUMemoryRegion *mr, hwaddr iova,
+                                    hwaddr paddr, hwaddr size)
+{
+    IOMMUTLBEntry entry;
+
+    entry.target_as = &address_space_memory;
+    entry.addr_mask = size - 1;
+
+    entry.iova = iova;
+    trace_virtio_iommu_notify_map(mr->parent_obj.name, iova, paddr, size);
+    entry.perm = IOMMU_RW;
+    entry.translated_addr = paddr;
+
+    memory_region_notify_iommu(mr, entry);
+}
+
+static void virtio_iommu_notify_unmap(IOMMUMemoryRegion *mr, hwaddr iova,
+                                      hwaddr size)
+{
+    IOMMUTLBEntry entry;
+
+    entry.target_as = &address_space_memory;
+    entry.addr_mask = size - 1;
+
+    entry.iova = iova;
+    trace_virtio_iommu_notify_unmap(mr->parent_obj.name, iova, size);
+    entry.perm = IOMMU_NONE;
+    entry.translated_addr = 0;
+
+    memory_region_notify_iommu(mr, entry);
+}
+
 static void virtio_iommu_detach_endpoint_from_domain(viommu_endpoint *ep)
 {
     QLIST_REMOVE(ep, next);
@@ -310,6 +342,8 @@ static int virtio_iommu_map(VirtIOIOMMU *s,
     viommu_domain *domain;
     viommu_interval *interval;
     viommu_mapping *mapping;
+    VirtioIOMMUNotifierNode *node;
+    viommu_endpoint *ep;
 
     interval = g_malloc0(sizeof(*interval));
 
@@ -337,7 +371,35 @@ static int virtio_iommu_map(VirtIOIOMMU *s,
 
     g_tree_insert(domain->mappings, interval, mapping);
 
+    /* All devices in an address-space share mapping */
+    QLIST_FOREACH(node, &s->notifiers_list, next) {
+        QLIST_FOREACH(ep, &domain->endpoint_list, next) {
+            if (ep->id == node->iommu_dev->devfn) {
+                virtio_iommu_notify_map(&node->iommu_dev->iommu_mr,
+                                        virt_start, phys_start, mapping->size);
+            }
+        }
+    }
+
     return VIRTIO_IOMMU_S_OK;
+}
+
+static void virtio_iommu_remove_mapping(VirtIOIOMMU *s, viommu_domain *domain,
+                                        viommu_interval *interval)
+{
+    VirtioIOMMUNotifierNode *node;
+    viommu_endpoint *ep;
+
+    g_tree_remove(domain->mappings, (gpointer)(interval));
+    QLIST_FOREACH(node, &s->notifiers_list, next) {
+        QLIST_FOREACH(ep, &domain->endpoint_list, next) {
+            if (ep->id == node->iommu_dev->devfn) {
+                virtio_iommu_notify_unmap(&node->iommu_dev->iommu_mr,
+                                          interval->low,
+                                          interval->high - interval->low + 1);
+            }
+        }
+    }
 }
 
 static int virtio_iommu_unmap(VirtIOIOMMU *s,
@@ -372,18 +434,18 @@ static int virtio_iommu_unmap(VirtIOIOMMU *s,
         current.high = high;
 
         if (low == interval.low && size >= mapping->size) {
-            g_tree_remove(domain->mappings, (gpointer)(&current));
+            virtio_iommu_remove_mapping(s, domain, &current);
             interval.low = high + 1;
             trace_virtio_iommu_unmap_left_interval(current.low, current.high,
                 interval.low, interval.high);
         } else if (high == interval.high && size >= mapping->size) {
             trace_virtio_iommu_unmap_right_interval(current.low, current.high,
                 interval.low, interval.high);
-            g_tree_remove(domain->mappings, (gpointer)(&current));
+            virtio_iommu_remove_mapping(s, domain, &current);
             interval.high = low - 1;
         } else if (low > interval.low && high < interval.high) {
             trace_virtio_iommu_unmap_inc_interval(current.low, current.high);
-            g_tree_remove(domain->mappings, (gpointer)(&current));
+            virtio_iommu_remove_mapping(s, domain, &current);
         } else {
             break;
         }
@@ -926,6 +988,7 @@ static void virtio_iommu_device_realize(DeviceState *dev, Error **errp)
         goto err;
     }
 
+    QLIST_INIT(&s->notifiers_list);
     virtio_init(vdev, "virtio-iommu", VIRTIO_ID_IOMMU,
                 sizeof(struct virtio_iommu_config));
 
